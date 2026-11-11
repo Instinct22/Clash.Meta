@@ -56,6 +56,7 @@ type Conn struct {
 	closeMutex sync.Mutex
 	closed     bool
 	onClose    func()
+	activity   *Activity
 
 	// deadlines
 	deadline *time.Timer
@@ -98,7 +99,11 @@ func (g *Conn) Read(b []byte) (n int, err error) {
 	if err = g.Init(); err != nil {
 		return
 	}
-	return g.read(b)
+	n, err = g.read(b)
+	if n > 0 && g.activity != nil {
+		g.activity.read(time.Now().UnixNano())
+	}
+	return
 }
 
 func (g *Conn) read(b []byte) (n int, err error) {
@@ -143,6 +148,7 @@ func (g *Conn) Write(b []byte) (n int, err error) {
 	binary.PutUvarint(buf[6:], uint64(dataLen))
 	copy(buf[6+varLen:], b)
 
+	g.markWrite()
 	_, err = g.writer.Write(buf)
 	if err == io.ErrClosedPipe {
 		if initErr := g.Init(); initErr != nil {
@@ -167,6 +173,7 @@ func (g *Conn) WriteBuffer(buffer *buf.Buffer) error {
 	binary.BigEndian.PutUint32(header[1:5], uint32(1+varLen+dataLen))
 	header[5] = 0x0A
 	binary.PutUvarint(header[6:], uint64(dataLen))
+	g.markWrite()
 	_, err := g.writer.Write(buffer.Bytes())
 
 	if err == io.ErrClosedPipe {
@@ -180,6 +187,14 @@ func (g *Conn) WriteBuffer(buffer *buf.Buffer) error {
 	}
 
 	return err
+}
+
+// markWrite starts the wait before the write: a write held up because the
+// connection is still opening is the longest wait of all.
+func (g *Conn) markWrite() {
+	if g.activity != nil {
+		g.activity.wrote(time.Now().UnixNano())
+	}
 }
 
 func (g *Conn) FrontHeadroom() int {
@@ -249,18 +264,30 @@ type Transport struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	closeOnce sync.Once
+	closed    atomic.Bool
 	count     atomic.Int64
+	activity  Activity
+	trace     *Trace
 }
 
 func (t *Transport) Close() error {
 	t.closeOnce.Do(func() {
+		t.closed.Store(true)
 		t.cancel()
 		httputils.CloseTransport(t.transport)
 	})
 	return nil
 }
 
+// bind ties the transport, its dial and its TLS handshake to ctx. It must run
+// before the first stream is opened.
+func (t *Transport) bind(ctx context.Context) {
+	t.cancel()
+	t.ctx, t.cancel = context.WithCancel(ctx)
+}
+
 func NewTransport(dialFn DialFn, tlsConfig *vmess.TLSConfig, gunCfg *Config) *Transport {
+	wrap := &Transport{cfg: gunCfg}
 	dialFunc := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		ctx, cancel := context.WithTimeout(ctx, C.DefaultTLSTimeout)
 		defer cancel()
@@ -268,8 +295,10 @@ func NewTransport(dialFn DialFn, tlsConfig *vmess.TLSConfig, gunCfg *Config) *Tr
 		if err != nil {
 			return nil, err
 		}
+		wrap.trace.markTCP()
 
 		if tlsConfig == nil {
+			wrap.trace.markTLS()
 			return pconn, nil
 		}
 
@@ -286,6 +315,7 @@ func NewTransport(dialFn DialFn, tlsConfig *vmess.TLSConfig, gunCfg *Config) *Tr
 				return nil, fmt.Errorf("http2: unexpected ALPN protocol %s, want %s", p, Http2NextProtoTLS)
 			}
 		}
+		wrap.trace.markTLS()
 		return conn, nil
 	}
 
@@ -306,19 +336,19 @@ func NewTransport(dialFn DialFn, tlsConfig *vmess.TLSConfig, gunCfg *Config) *Tr
 		},
 		Protocols:          protocols,
 		DisableCompression: true,
+		// Streams that arrive while the connection is still being opened
+		// would each dial a TCP and TLS handshake of their own. A burst of
+		// handshakes with one SNI gets the pair of client address and SNI
+		// frozen on the way, so they wait for the one connection instead.
+		MaxConnsPerHost: 1,
 		HTTP2: &http.HTTP2Config{
 			SendPingTimeout: time.Duration(gunCfg.PingInterval) * time.Second, // If zero, no health check is performed,
 			PingTimeout:     0,
 		},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	wrap := &Transport{
-		transport: transport,
-		cfg:       gunCfg,
-		ctx:       ctx,
-		cancel:    cancel,
-	}
+	wrap.transport = transport
+	wrap.ctx, wrap.cancel = context.WithCancel(context.Background())
 	return wrap
 }
 
@@ -330,6 +360,10 @@ func ServiceNameToPath(serviceName string) string {
 }
 
 func (t *Transport) Dial() (net.Conn, error) {
+	return t.dial(nil), nil
+}
+
+func (t *Transport) dial(onClose func()) *Conn {
 	serviceName := "GunService"
 	if t.cfg.ServiceName != "" {
 		serviceName = t.cfg.ServiceName
@@ -371,11 +405,17 @@ func (t *Transport) Dial() (net.Conn, error) {
 			}
 			return response.Body, nil
 		},
-		writer: writer,
+		writer:   writer,
+		activity: &t.activity,
 	}
 
 	t.count.Add(1)
-	conn.onClose = func() { t.count.Add(-1) }
+	conn.onClose = func() {
+		t.count.Add(-1)
+		if onClose != nil {
+			onClose()
+		}
+	}
 
 	go conn.Init()
 
@@ -383,7 +423,7 @@ func (t *Transport) Dial() (net.Conn, error) {
 	// prevent the race caused by the return side immediately calling conn.Close
 	<-initStarted
 
-	return conn, nil
+	return conn
 }
 
 type Client struct {
@@ -429,6 +469,9 @@ func (c *Client) getTransport() *Transport {
 	defer c.mutex.Unlock()
 	var transport *Transport
 	for _, t := range c.transports {
+		if t.closed.Load() {
+			continue
+		}
 		if transport == nil || t.count.Load() < transport.count.Load() {
 			transport = t
 		}

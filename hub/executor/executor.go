@@ -112,9 +112,13 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	tunnel.OnInnerLoading()
 
 	initInnerTcp()
-	loadProvider(cfg.Providers)
+	loadProvider(cfg.Providers, func() {
+		if DefaultProvidersReadyHook != nil {
+			DefaultProvidersReadyHook(len(cfg.Providers))
+		}
+	})
 	updateProfile(cfg)
-	loadProvider(cfg.RuleProviders)
+	loadProvider(cfg.RuleProviders, nil)
 	runtime.GC()
 	tunnel.OnRunning()
 	updateUpdater(cfg)
@@ -315,7 +319,7 @@ func updateRules(rules []C.Rule, subRules map[string][]C.Rule, ruleProviders map
 	tunnel.UpdateRules(rules, subRules, ruleProviders)
 }
 
-func loadProvider[T P.Provider](providers map[string]T) {
+func loadProvider[T P.Provider](providers map[string]T, done func()) {
 	load := func(pv T) {
 		name := pv.Name()
 		if pv.VehicleType() == P.Compatible {
@@ -351,6 +355,12 @@ func loadProvider[T P.Provider](providers map[string]T) {
 		go func() {
 			defer func() { <-ch; wg.Done() }()
 			load(pv)
+		}()
+	}
+	if done != nil {
+		go func() {
+			wg.Wait()
+			done()
 		}()
 	}
 }
